@@ -22,6 +22,13 @@ pip install huggingface_hub[cli] hf_transfer datasets
 
 echo "=== Compiling CUDA denominator extension ==="
 # Must be run on a machine with a CUDA-capable GPU and CUDA toolkit installed.
-python3 setup.py build_ext --inplace
+# Non-fatal: if torch's CUDA version differs from the system toolkit (e.g. a
+# cu128 torch wheel on a CUDA 13.0 box), this AOT build trips torch's version
+# check. That's OK — the kernel is JIT-compiled on first import via
+# src/load_cuda.py, which bypasses the check. The tests rely on the JIT path.
+python3 setup.py build_ext --inplace || {
+    echo "WARNING: AOT build_ext failed (likely a torch/toolkit CUDA version mismatch)."
+    echo "This is non-fatal — the kernel will JIT-compile on first import."
+}
 
 echo "=== All dependencies installed ==="
