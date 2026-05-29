@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# CUDA build artefacts
+*.o
+*.a
+
+# Model checkpoints (too large for git)
+qwen3-480b-*/
+*.safetensors
+*.bin
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Local Claude Code settings
+.claude/settings.local.json
