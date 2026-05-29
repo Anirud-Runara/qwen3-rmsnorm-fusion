@@ -12,7 +12,7 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-arch=sm_90", "-O3", "--use_fast_math"],
+                "nvcc": ["-arch=sm_120", "-O3", "--use_fast_math"],
             },
         ),
     ],

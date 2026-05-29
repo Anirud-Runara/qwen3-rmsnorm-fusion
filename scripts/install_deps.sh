@@ -9,7 +9,14 @@
 set -euo pipefail
 
 echo "=== Installing core Python dependencies ==="
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch: Blackwell GPUs (sm_120, e.g. RTX Pro 6000) require CUDA 12.8+ wheels.
+# Most GPU base images already ship a CUDA-capable PyTorch — reinstalling can
+# downgrade it to a build without Blackwell kernels, so only install if missing.
+if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "PyTorch already present: $(python3 -c 'import torch; print(torch.__version__, torch.version.cuda)')"
+else
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+fi
 pip install transformers accelerate
 pip install huggingface_hub[cli] hf_transfer datasets
 
