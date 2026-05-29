@@ -159,11 +159,13 @@ def test_fused_rmsnorm_combined_unit_bf16():
             nn.init.normal_(lin.weight, mean=0.0, std=0.02)
             linears.append(lin)
 
-        # Compute fused weights in FP32 for numerical stability, then cast
+        # Compute fused weights in FP32 (numerical stability), then cast to BF16.
+        # Use deep copies: nn.Module.float() converts IN PLACE and would corrupt
+        # rms_norm / linears, which must stay BF16 for the reference below.
+        rms_fp32 = copy.deepcopy(rms_norm).float()
+        lin_fp32 = [copy.deepcopy(l).float() for l in linears]
         W_comb, b_comb, split_sizes, h_dim, eps = \
-            compute_fused_weights_rmsnorm_combined(
-                rms_norm.float(), [l.float() for l in linears]
-            )
+            compute_fused_weights_rmsnorm_combined(rms_fp32, lin_fp32)
         W_comb = W_comb.bfloat16().cuda()
         b_comb = b_comb.bfloat16().cuda()
 
