@@ -3,30 +3,35 @@ Monkey-patch a Qwen3 / Qwen3-MoE model to use fused RMSNorm+Linear modules.
 
 Replaces the forward pass of each Qwen3 decoder layer so that:
   - input_layernorm + q/k/v_proj -> fused_qkv (combined: one matmul + one
-    RMSNorm-normalize kernel call)
+    CUDA normalize kernel) at RUNTIME, for maximum throughput.
 
-Only attention QKV is fused.  The MLP (dense or sparse MoE) is left untouched:
-for MoE the router dispatches tokens between the norm output and the experts,
-making norm-into-expert fusion impractical.
+IMPORTANT — two-phase approach
+-------------------------------
+1. Offline weight transform (Test A / fuse_model.py):
+   `_offline_fuse_layer` simply modifies weights in-place (W *= gamma,
+   gamma = 1) and lets the original HF forward run. No CUDA extension needed.
+   This is the artifact that gets stored and quantized. It does NOT speed
+   anything up on its own.
 
-Design notes (transformers >= 5.x):
-  - The attention forward now returns (attn_output, attn_weights) and dispatches
-    through ALL_ATTENTION_FUNCTIONS (which applies causal masking, sliding
-    window, and the configured SDPA/flash/eager kernel).  We reproduce that
-    exact post-projection pipeline rather than re-implementing attention by
-    hand, and we pull the helper symbols (apply_rotary_pos_emb,
-    eager_attention_forward, ALL_ATTENTION_FUNCTIONS) from the attention
-    class's own module so the same patch works for dense Qwen3 and Qwen3-MoE.
-  - The decoder layer forward returns a bare hidden_states tensor.
-  - Per-head QK norms (q_norm / k_norm) run AFTER the projection on the
-    projected Q/K, exactly as upstream — independent of this fusion.
-  - input_layernorm is SKIPPED in the layer forward; its scale (gamma) and the
-    1/rms normalization are absorbed into the fused QKV module.
+2. Runtime CUDA kernel (Test B / serving + benchmark — THIS file):
+   `patch_qwen3_model` swaps in the fused CUDA kernel. This is where the
+   speedup comes from. Requires the compiled extension (JIT via load_cuda).
 
-Usage:
-    from src.patch_qwen3 import patch_qwen3_model
-    model = AutoModelForCausalLM.from_pretrained(...)
-    model = patch_qwen3_model(model, device="cuda", variant="V3")
+The runtime forward delegates attention to transformers' own
+ALL_ATTENTION_FUNCTIONS dispatch, so the attention backend is IDENTICAL to the
+unpatched baseline. That is required for a fair benchmark: the measured delta
+is then attributable purely to the RMSNorm+QKV fusion, not to an attention-impl
+difference.
+
+Architecture notes (Qwen3 / Qwen3-MoE)
+---------------------------------------
+- input_layernorm -> [q_proj, k_proj, v_proj]   <- FUSED HERE
+- Per-head q_norm / k_norm run AFTER projection; independent of this fusion.
+- MoE MLP NOT fused (router sits between norm and experts).
+- Dense MLP NOT fused either (out of scope).
+
+Tested with transformers >= 5.0 (uses the ALL_ATTENTION_FUNCTIONS dispatch and
+the bare-tensor decoder-layer return convention).
 """
 
 import sys
@@ -45,23 +50,40 @@ _COMBINED_VARIANT_CLASSES = {
 }
 
 
+# ------------------------------------------------------------------ #
+# Offline helper (Test A / fuse_model.py path — no CUDA kernel)        #
+# ------------------------------------------------------------------ #
+
+def _offline_fuse_layer(layer) -> None:
+    """
+    In-place offline fusion: W *= gamma, gamma = 1.
+    Uses the original HF forward — no CUDA extension needed.
+    This is what fuse_model.py does to the 480B checkpoint.
+    """
+    attn = layer.self_attn
+    gamma = layer.input_layernorm.weight.data.clone()
+    for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
+        proj.weight.data.mul_(gamma)
+    layer.input_layernorm.weight.data.fill_(1.0)
+
+
+# ------------------------------------------------------------------ #
+# Runtime CUDA patch (Test B / serving)                                #
+# ------------------------------------------------------------------ #
+
 def patch_qwen3_model(model, device=None, variant="V3"):
     """
-    Patch all decoder layers in a Qwen3 / Qwen3-MoE model to use fused RMSNorm+QKV.
+    Patch all decoder layers to use the fused RMSNorm+QKV CUDA kernel.
 
     Args:
-        model: HuggingFace Qwen3ForCausalLM or Qwen3MoeForCausalLM (BF16, CPU or GPU)
-        device: target device for fused weight tensors (defaults to model device)
-        variant: kernel variant -- "V1" (256 threads) or "V3" (512 threads, recommended)
-
-    Returns:
-        The patched model (modified in-place)
+        model: Qwen3ForCausalLM or Qwen3MoeForCausalLM
+        device: target device (default: model's current device)
+        variant: "V1" (256 threads) or "V3" (512 threads)
     """
     if variant not in _COMBINED_VARIANT_CLASSES:
         raise ValueError(
             f"Unknown variant {variant!r}; choose from {list(_COMBINED_VARIANT_CLASSES)}"
         )
-
     if device is None:
         device = next(model.parameters()).device
 
@@ -72,7 +94,7 @@ def patch_qwen3_model(model, device=None, variant="V3"):
 
 
 def _patch_decoder_layer(layer, device, variant: str = "V3"):
-    """Patch a single Qwen3 decoder layer with fused RMSNorm+QKV."""
+    """Patch a single decoder layer."""
     fused_weights = transform_qwen3_layer(layer)
     cls = _COMBINED_VARIANT_CLASSES[variant]
 
@@ -87,12 +109,14 @@ def _patch_decoder_layer(layer, device, variant: str = "V3"):
 
 def _patch_attention_forward(attn):
     """
-    Replace attention forward to use fused QKV (skipping the standalone
-    input_layernorm + q/k/v_proj), then reproduce the upstream post-projection
-    pipeline verbatim (q_norm/k_norm, RoPE, cache, attention dispatch, o_proj).
+    Replace attention forward to use fused QKV (skipping standalone RMSNorm),
+    then reproduce the upstream post-projection pipeline verbatim.
+
+    Helper symbols are pulled from the attention class's own module so the same
+    patch works for dense Qwen3 (modeling_qwen3) and Qwen3-MoE
+    (modeling_qwen3_moe).  Attention itself is dispatched through
+    ALL_ATTENTION_FUNCTIONS — identical backend to the unpatched model.
     """
-    # Pull the exact helper symbols the real forward uses, from the attention
-    # class's own module (modeling_qwen3 or modeling_qwen3_moe).
     _mod = sys.modules[type(attn).__module__]
     apply_rotary_pos_emb = _mod.apply_rotary_pos_emb
     eager_attention_forward = _mod.eager_attention_forward
@@ -104,15 +128,11 @@ def _patch_attention_forward(attn):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values=None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, attn.head_dim)
 
-        # ------------------------------------------------------------------ #
-        # Fused RMSNorm + Q/K/V projections in one call.                      #
-        # input_layernorm is baked into the fused weights; skip it here.      #
-        # q_raw/k_raw/v_raw == q_proj(input_layernorm(x)) etc.                #
-        # ------------------------------------------------------------------ #
+        # Fused RMSNorm + Q/K/V projections (input_layernorm folded into weights)
         q_raw, k_raw, v_raw = attn.fused_qkv(hidden_states)
 
         # Per-head QK norms run on the projected Q/K, exactly as upstream.
@@ -154,9 +174,8 @@ def _patch_attention_forward(attn):
 def _patch_layer_forward(layer):
     """
     Replace decoder layer forward to skip input_layernorm (fused into QKV).
-
     Returns a bare hidden_states tensor (transformers >= 5.x convention).
-    post_attention_layernorm and the MLP (dense or MoE) run unchanged.
+    Handles dense (tensor) and MoE ((hidden, router_logits)) MLP returns.
     """
 
     def patched_forward(
@@ -170,7 +189,7 @@ def _patch_layer_forward(layer):
     ) -> torch.Tensor:
         residual = hidden_states
 
-        # input_layernorm is SKIPPED — it is fused into fused_qkv weights.
+        # input_layernorm is SKIPPED — fused into fused_qkv weights.
         hidden_states, _ = layer.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -182,12 +201,11 @@ def _patch_layer_forward(layer):
         )
         hidden_states = residual + hidden_states
 
-        # MLP path: post_attention_layernorm runs as normal. The dense Qwen3
-        # mlp returns a tensor; the sparse Qwen3-MoE mlp returns (hidden, router).
+        # MLP path — post_attention_layernorm runs as normal.
         residual = hidden_states
         hidden_states = layer.post_attention_layernorm(hidden_states)
         mlp_out = layer.mlp(hidden_states)
-        if isinstance(mlp_out, tuple):
+        if isinstance(mlp_out, (tuple, list)):
             mlp_out = mlp_out[0]
         hidden_states = residual + mlp_out
 
