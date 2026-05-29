@@ -27,13 +27,8 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 from src.load_cuda import denominator_cuda
-from src.weight_transform import (
-    compute_fused_weights_rmsnorm,
-    compute_fused_weights_rmsnorm_combined,
-)
+from src.weight_transform import compute_fused_weights_rmsnorm_combined
 from src.fused_forward import (
-    fused_rmsnorm_linear_forward_v1,
-    fused_rmsnorm_linear_forward_v3,
     FusedRMSNormCombinedLinearV1,
     FusedRMSNormCombinedLinearV3,
 )
@@ -63,17 +58,24 @@ QWEN3_CONFIGS = [
 
 def test_fused_rmsnorm_combined_unit_fp32():
     """
-    FP32 unit test: FusedRMSNormCombined[V1/V3] vs separate fused calls.
+    FP32 unit test: FusedRMSNormCombined[V1/V3] vs plain-PyTorch RMSNorm->Linear.
 
-    Mirrors test_fused_rmsnorm_combined_unit() from the reference repo but
-    uses Qwen3 QKV dimensions instead of Llama/TinyLlama ones.
-    Pass threshold: 1e-5  (should be exact in FP32 — same kernel, same weights)
+    Ground-truth correctness check: the fused combined kernel must match the
+    standard sequential RMSNorm + Linear computed in PyTorch (the real
+    reference), not just agree with another kernel call. Same comparison the
+    bf16 test does, in fp32.
+
+    Pass threshold: 1e-4. fp32 agreement between matmul-then-normalize (kernel)
+    and normalize-then-matmul (PyTorch) bottoms out at a few fp32 ULPs (~1e-5 at
+    h=7168) — far below the bf16 noise floor (~1.6e-2), so a real bug (which is
+    orders of magnitude larger) still fails loudly.
     """
     print("=" * 60)
     print("TEST: FusedRMSNormCombined — Qwen3 dims, FP32")
     print("=" * 60)
 
     torch.manual_seed(42)
+    fp32_tol = 1e-4
 
     for label, h, q_dim, k_dim, v_dim in QWEN3_CONFIGS:
         out_dims = [q_dim, k_dim, v_dim]
@@ -92,40 +94,29 @@ def test_fused_rmsnorm_combined_unit_fp32():
         for batch in [1, 32, 128]:
             x = torch.randn(batch, h, device="cuda", dtype=torch.float32)
 
-            # Reference: three separate fused calls (V1)
-            ref_parts = []
-            for lin in linears:
-                W_new, b_new, _, _ = compute_fused_weights_rmsnorm(rms_norm, lin)
-                ref_parts.append(
-                    fused_rmsnorm_linear_forward_v1(x, W_new, b_new, h_dim, eps)
-                )
+            # Ground-truth reference: plain PyTorch RMSNorm -> Linear
+            with torch.no_grad():
+                normed = rms_norm(x)
+                ref_parts = [lin(normed) for lin in linears]
 
             # Combined V1
             mod_v1 = FusedRMSNormCombinedLinearV1(W_comb, b_comb, split_sizes, h_dim, eps)
             with torch.no_grad():
                 out_v1 = mod_v1(x)
             md_v1 = max((r - o).abs().max().item() for r, o in zip(ref_parts, out_v1))
-            s_v1 = "PASS" if md_v1 < 1e-5 else "FAIL"
-
-            # Reference for V3
-            ref_parts_v3 = []
-            for lin in linears:
-                W_new, b_new, _, _ = compute_fused_weights_rmsnorm(rms_norm, lin)
-                ref_parts_v3.append(
-                    fused_rmsnorm_linear_forward_v3(x, W_new, b_new, h_dim, eps)
-                )
+            s_v1 = "PASS" if md_v1 < fp32_tol else "FAIL"
 
             # Combined V3
             mod_v3 = FusedRMSNormCombinedLinearV3(W_comb, b_comb, split_sizes, h_dim, eps)
             with torch.no_grad():
                 out_v3 = mod_v3(x)
-            md_v3 = max((r - o).abs().max().item() for r, o in zip(ref_parts_v3, out_v3))
-            s_v3 = "PASS" if md_v3 < 1e-5 else "FAIL"
+            md_v3 = max((r - o).abs().max().item() for r, o in zip(ref_parts, out_v3))
+            s_v3 = "PASS" if md_v3 < fp32_tol else "FAIL"
 
             print(f"  [{s_v1}] {label} batch={batch:3d}: "
                   f"V1 max_diff={md_v1:.2e}  [{s_v3}] V3 max_diff={md_v3:.2e}")
-            assert md_v1 < 1e-5, f"Combined V1 FP32 failed for {label}: max_diff={md_v1}"
-            assert md_v3 < 1e-5, f"Combined V3 FP32 failed for {label}: max_diff={md_v3}"
+            assert md_v1 < fp32_tol, f"Combined V1 FP32 failed for {label}: max_diff={md_v1}"
+            assert md_v3 < fp32_tol, f"Combined V3 FP32 failed for {label}: max_diff={md_v3}"
 
     print("  All FP32 combined unit tests passed!\n")
 
@@ -209,8 +200,9 @@ def test_fused_rmsnorm_combined_3d_input():
     """
     3D input test: [batch, seq_len, h] — matches real inference shapes.
 
-    Mirrors test_fused_ln_linear_3d() from the reference repo.
-    Pass threshold: 1e-5 (FP32).
+    Ground-truth check against plain-PyTorch RMSNorm->Linear, exercising the
+    module's [B,S,H] -> flatten -> kernel -> split -> [B,S,out] reshape path.
+    Pass threshold: 1e-4 (FP32).
     """
     print("=" * 60)
     print("TEST: FusedRMSNormCombined — 3D input [batch, seq, h], FP32")
@@ -232,17 +224,18 @@ def test_fused_rmsnorm_combined_3d_input():
         W_comb, b_comb, split_sizes, h_dim, eps = \
             compute_fused_weights_rmsnorm_combined(rms_norm, linears)
 
-        # 3D input: [batch, seq_len, h]
+        # FP32 tolerance: matmul-then-normalize (kernel) vs normalize-then-matmul
+        # (plain PyTorch) is not bit-exact — fp32 non-associativity at large h
+        # (e.g. 7168) reaches ~1e-5. 1e-4 sits well below the bf16 noise floor
+        # (~1.6e-2), so it confirms correctness without false failures.
+        fp32_tol = 1e-4
         for batch, seq_len in [(1, 8), (4, 128), (2, 512)]:
             x = torch.randn(batch, seq_len, h, device="cuda", dtype=torch.float32)
 
-            # Reference: separate V1 fused calls
-            ref_parts = []
-            for lin in linears:
-                W_new, b_new, _, _ = compute_fused_weights_rmsnorm(rms_norm, lin)
-                ref_parts.append(
-                    fused_rmsnorm_linear_forward_v1(x, W_new, b_new, h_dim, eps)
-                )
+            # Ground-truth reference: plain PyTorch RMSNorm -> Linear
+            with torch.no_grad():
+                normed = rms_norm(x)
+                ref_parts = [lin(normed) for lin in linears]
 
             # Combined V3
             mod_v3 = FusedRMSNormCombinedLinearV3(W_comb, b_comb, split_sizes, h_dim, eps)
@@ -250,9 +243,9 @@ def test_fused_rmsnorm_combined_3d_input():
                 out_v3 = mod_v3(x)
 
             md = max((r - o).abs().max().item() for r, o in zip(ref_parts, out_v3))
-            s = "PASS" if md < 1e-5 else "FAIL"
+            s = "PASS" if md < fp32_tol else "FAIL"
             print(f"  [{s}] {label} [{batch}, {seq_len}, {h}]: max_diff={md:.2e}")
-            assert md < 1e-5, f"3D V3 failed for {label}: max_diff={md}"
+            assert md < fp32_tol, f"3D V3 failed for {label}: max_diff={md}"
 
     print("  All 3D input tests passed!\n")
 
