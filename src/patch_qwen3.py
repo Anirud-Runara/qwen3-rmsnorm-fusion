@@ -113,10 +113,14 @@ def _patch_attention_forward(attn: Qwen3MoeAttention):
         # ------------------------------------------------------------------ #
         q_raw, k_raw, v_raw = attn.fused_qkv(hidden_states)
 
-        # Reshape: [bsz, seq, head_dim * n_heads] -> [bsz, n_heads, seq, head_dim]
-        query_states = q_raw.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
-        key_states   = k_raw.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-        value_states = v_raw.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+        # Reshape to [bsz, n_heads, seq, head_dim]. Use -1 to infer the head
+        # count from the tensor: newer transformers no longer expose
+        # attn.num_heads / attn.num_key_value_heads as module attributes, and
+        # the q/k/v split sizes already encode the correct head counts.
+        head_dim = attn.head_dim
+        query_states = q_raw.view(bsz, q_len, -1, head_dim).transpose(1, 2)
+        key_states   = k_raw.view(bsz, q_len, -1, head_dim).transpose(1, 2)
+        value_states = v_raw.view(bsz, q_len, -1, head_dim).transpose(1, 2)
 
         # Per-head QK norms (Qwen3-specific) — preserved, run after projection
         query_states = attn.q_norm(query_states)
@@ -149,7 +153,7 @@ def _patch_attention_forward(attn: Qwen3MoeAttention):
 
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, attn.num_heads * attn.head_dim)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = attn.o_proj(attn_output)
 
         if not output_attentions:
@@ -196,10 +200,17 @@ def _patch_layer_forward(layer: Qwen3MoeDecoderLayer):
         )
         hidden_states = residual + hidden_states
 
-        # MoE MLP path: post_attention_layernorm runs as normal
+        # MLP path: post_attention_layernorm runs as normal.
+        # Qwen3-MoE's sparse mlp returns (hidden_states, router_logits); the
+        # dense Qwen3 mlp (e.g. the small 0.6B test model) returns just a
+        # tensor. Handle both so the patch works on either model family.
         residual = hidden_states
         hidden_states = layer.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = layer.mlp(hidden_states)
+        mlp_out = layer.mlp(hidden_states)
+        if isinstance(mlp_out, tuple):
+            hidden_states, router_logits = mlp_out
+        else:
+            hidden_states, router_logits = mlp_out, None
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)

@@ -14,7 +14,7 @@ denominator_cuda = ext.load(
         os.path.join(_ROOT, "csrc", "denominator.cpp"),
         os.path.join(_ROOT, "csrc", "denominator_kernel.cu"),
     ],
-    extra_cuda_cflags=["-arch=sm_120", "-O3", "--use_fast_math"],
+    extra_cuda_cflags=["-arch=sm_120", "-O3"],
     extra_cflags=["-O3"],
     verbose=False,
 )
