@@ -87,8 +87,15 @@ def level1_synthetic():
         ref_out = lin(rms(x))
         fused_out = fused(x)[0]  # fused returns list of tensors
 
-    max_diff = (ref_out - fused_out).abs().max().item()
-    return _check("RMSNorm+Linear fusion", max_diff, 1e-2)
+    # bf16 max-abs diff is dominated by 1 ULP on the largest element (e.g. at
+    # magnitude ~8, one bf16 ULP is 0.0625), so an absolute threshold is not
+    # meaningful here. Compare relative error against the bf16 reference.
+    ref_f, fused_f = ref_out.float(), fused_out.float()
+    max_abs = (ref_f - fused_f).abs().max().item()
+    out_scale = ref_f.abs().max().item()
+    rel = max_abs / out_scale if out_scale > 0 else max_abs
+    print(f"    (abs max_diff={max_abs:.3e}, output max|.|={out_scale:.2f})")
+    return _check("RMSNorm+Linear fusion (relative)", rel, 2e-2)
 
 
 # ------------------------------------------------------------------ #
