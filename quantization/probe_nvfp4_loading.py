@@ -116,10 +116,13 @@ def main():
 
     if args.use_modelopt:
         try:
-            import modelopt.torch.quantization  # noqa  (registers modelopt quant w/ transformers)
-            print("modelopt.torch.quantization imported.")
+            # The correct enabler — patches HF from_pretrained to restore modelopt
+            # state. Just importing the package is NOT enough.
+            import modelopt.torch.opt as mto
+            mto.enable_huggingface_checkpointing()
+            print("modelopt: enable_huggingface_checkpointing() done.")
         except Exception as e:
-            print(f"WARNING: could not import modelopt ({e}); install 'nvidia-modelopt[hf]'")
+            print(f"WARNING: modelopt HF enablement failed ({e}); install 'nvidia-modelopt[hf]'")
 
     from transformers import AutoModelForCausalLM
 
