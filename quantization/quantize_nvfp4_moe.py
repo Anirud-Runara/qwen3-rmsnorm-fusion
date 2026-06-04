@@ -64,6 +64,12 @@ def parse_args():
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--offload-dir", default=None,
                    help="Disk offload folder for the 480B if CPU RAM is tight")
+    p.add_argument("--sequential-targets", nargs="+", default=None,
+                   help="Granularity of the sequential pipeline. Default = the decoder layer, "
+                        "which on a huge MoE (160 experts/layer) can OOM a single GPU. "
+                        "Set to 'Linear' to calibrate ONE matmul at a time → far lower peak "
+                        "VRAM (slower due to more on/off-loading). Fixes the "
+                        "'choose a smaller module for sequential_targets' OOM.")
     return p.parse_args()
 
 
@@ -106,7 +112,13 @@ def main():
     ignore = ["lm_head", "re:.*mlp.gate$"]
     print(f"Scheme: {args.scheme} | ignore (high precision): {ignore}")
 
-    recipe = QuantizationModifier(targets="Linear", scheme=args.scheme, ignore=ignore)
+    # sequential_targets controls how much is on the GPU at once during calibration.
+    # Default (decoder layer) holds a whole MoE block (all experts) → OOM on big MoE.
+    # "Linear" calibrates one matmul at a time → much lower peak VRAM.
+    recipe = QuantizationModifier(
+        targets="Linear", scheme=args.scheme, ignore=ignore,
+        sequential_targets=args.sequential_targets,
+    )
 
     # oneshot runs the sequential (layer-by-layer) pipeline; for NVFP4 (W4A4) it
     # uses the calibration data to fit activation scales. llm-compressor >=0.9
