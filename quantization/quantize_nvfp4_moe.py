@@ -112,24 +112,22 @@ def main():
     ignore = ["lm_head", "re:.*mlp.gate$"]
     print(f"Scheme: {args.scheme} | ignore (high precision): {ignore}")
 
-    # sequential_targets controls how much is on the GPU at once during calibration.
-    # Default (decoder layer) holds a whole MoE block (all experts) → OOM on big MoE.
-    # "Linear" calibrates one matmul at a time → much lower peak VRAM.
-    recipe = QuantizationModifier(
-        targets="Linear", scheme=args.scheme, ignore=ignore,
-        sequential_targets=args.sequential_targets,
-    )
+    recipe = QuantizationModifier(targets="Linear", scheme=args.scheme, ignore=ignore)
 
     # oneshot runs the sequential (layer-by-layer) pipeline; for NVFP4 (W4A4) it
     # uses the calibration data to fit activation scales. llm-compressor >=0.9
     # applies the MoE calibration context so all experts receive tokens.
     ds = None if args.scheme == "NVFP4A16" else build_calibration(tokenizer, args)
+    # sequential_targets belongs on oneshot() (the pipeline), NOT on QuantizationModifier.
+    # Default = the decoder layer (no_split_modules); a whole MoE block can OOM one GPU.
+    # Pass --sequential-targets Linear to calibrate one matmul at a time → lower peak VRAM.
     oneshot(
         model=model,
         dataset=ds,
         recipe=recipe,
         max_seq_length=args.seq_len,
         num_calibration_samples=args.calib_samples,
+        sequential_targets=args.sequential_targets,
     )
 
     print(f"Saving compressed-tensors NVFP4 model to {args.output_dir} ...")
