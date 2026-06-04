@@ -71,6 +71,10 @@ def parse_args():
                         "to leave headroom for the sequential pipeline.")
     p.add_argument("--max-cpu-mem", default="200GiB",
                    help="CPU RAM budget for offload; overflow spills to --offload-dir (disk).")
+    p.add_argument("--offload-device", default=None,
+                   help="Where the sequential pipeline parks calibration intermediates "
+                        "(default 'cpu'). Set 'cuda:1' to push the growing cache onto a 2nd "
+                        "idle GPU instead of letting it accumulate on the compute GPU → OOM.")
     p.add_argument("--sequential-targets", nargs="+", default=None,
                    help="Granularity of the sequential pipeline. Default = the decoder layer, "
                         "which on a huge MoE (160 experts/layer) can OOM a single GPU. "
@@ -137,7 +141,7 @@ def main():
     # sequential_targets belongs on oneshot() (the pipeline), NOT on QuantizationModifier.
     # Default = the decoder layer (no_split_modules); a whole MoE block can OOM one GPU.
     # Pass --sequential-targets Linear to calibrate one matmul at a time → lower peak VRAM.
-    oneshot(
+    oneshot_kwargs = dict(
         model=model,
         dataset=ds,
         recipe=recipe,
@@ -145,6 +149,9 @@ def main():
         num_calibration_samples=args.calib_samples,
         sequential_targets=args.sequential_targets,
     )
+    if args.offload_device:
+        oneshot_kwargs["sequential_offload_device"] = args.offload_device
+    oneshot(**oneshot_kwargs)
 
     print(f"Saving compressed-tensors NVFP4 model to {args.output_dir} ...")
     model.save_pretrained(args.output_dir, save_compressed=True)
