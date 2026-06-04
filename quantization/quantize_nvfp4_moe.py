@@ -64,6 +64,13 @@ def parse_args():
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--offload-dir", default=None,
                    help="Disk offload folder for the 480B if CPU RAM is tight")
+    p.add_argument("--max-gpu-mem", default=None,
+                   help="Per-GPU memory CAP for loading, e.g. '40GiB'. WITHOUT this, "
+                        "device_map='auto' fills every GPU with weights → no room to "
+                        "allocate quant scales / onload a layer → OOM at init. Cap it low "
+                        "to leave headroom for the sequential pipeline.")
+    p.add_argument("--max-cpu-mem", default="200GiB",
+                   help="CPU RAM budget for offload; overflow spills to --offload-dir (disk).")
     p.add_argument("--sequential-targets", nargs="+", default=None,
                    help="Granularity of the sequential pipeline. Default = the decoder layer, "
                         "which on a huge MoE (160 experts/layer) can OOM a single GPU. "
@@ -104,6 +111,15 @@ def main():
     load_kwargs = dict(dtype="auto", device_map="auto", trust_remote_code=True)
     if args.offload_dir:
         load_kwargs["offload_folder"] = args.offload_dir
+    if args.max_gpu_mem:
+        # Reserve headroom on each GPU. device_map='auto' otherwise fills every GPU
+        # with weights, leaving nothing for quant scales / per-layer onloading → OOM.
+        import torch
+        n = torch.cuda.device_count()
+        max_memory = {i: args.max_gpu_mem for i in range(n)}
+        max_memory["cpu"] = args.max_cpu_mem
+        load_kwargs["max_memory"] = max_memory
+        print(f"  max_memory cap: {max_memory} (overflow → {args.offload_dir or 'disk'})")
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 
