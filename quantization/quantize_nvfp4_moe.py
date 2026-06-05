@@ -138,19 +138,24 @@ def main():
     # uses the calibration data to fit activation scales. llm-compressor >=0.9
     # applies the MoE calibration context so all experts receive tokens.
     ds = None if args.scheme == "NVFP4A16" else build_calibration(tokenizer, args)
-    # sequential_targets belongs on oneshot() (the pipeline), NOT on QuantizationModifier.
-    # Default = the decoder layer (no_split_modules); a whole MoE block can OOM one GPU.
-    # Pass --sequential-targets Linear to calibrate one matmul at a time → lower peak VRAM.
-    oneshot_kwargs = dict(
-        model=model,
-        dataset=ds,
-        recipe=recipe,
-        max_seq_length=args.seq_len,
-        num_calibration_samples=args.calib_samples,
-        sequential_targets=args.sequential_targets,
-    )
-    if args.offload_device:
-        oneshot_kwargs["sequential_offload_device"] = args.offload_device
+    if ds is None:
+        # Weight-only NVFP4 (NVFP4A16) is DATA-FREE: weight scales come straight from the
+        # weights — no calibration forward passes, no MoE calibration context, no activation
+        # cache. This sidesteps ALL the W4A4 OOM/creep we fought. Just stream + pack weights.
+        print("Data-free weight-only quantization (no calibration dataset, no MoE calib pass).")
+        oneshot_kwargs = dict(model=model, recipe=recipe)
+    else:
+        # W4A4 path: sequential_targets goes on oneshot() (the pipeline), not the modifier.
+        oneshot_kwargs = dict(
+            model=model,
+            dataset=ds,
+            recipe=recipe,
+            max_seq_length=args.seq_len,
+            num_calibration_samples=args.calib_samples,
+            sequential_targets=args.sequential_targets,
+        )
+        if args.offload_device:
+            oneshot_kwargs["sequential_offload_device"] = args.offload_device
     oneshot(**oneshot_kwargs)
 
     print(f"Saving compressed-tensors NVFP4 model to {args.output_dir} ...")
