@@ -1,4 +1,51 @@
-# Quantization (AWQ W4A16, fusion-compatible)
+# Quantization
+
+## NVFP4A16 — shard-by-shard (recommended for 480B)
+
+`scripts/quantize_nvfp4_sharded.py` streams safetensors shards **one at a
+time** so peak RAM ≈ one shard (~4 GB) instead of the ~1 TiB needed by
+llm-compressor's DataFreePipeline.  No calibration data required (RTN,
+weight-only).
+
+```bash
+# 1. Dry-run: see which tensors would be quantized
+python3 scripts/quantize_nvfp4_sharded.py \
+    --model-dir /workspace/fused-bf16 \
+    --output-dir /workspace/fused-nvfp4 \
+    --dry-run
+
+# 2. Validate on 30B first (always do this before the 480B run)
+python3 scripts/quantize_nvfp4_sharded.py \
+    --model-dir /workspace/qwen3-30b \
+    --output-dir /workspace/qwen3-30b-nvfp4-test \
+    --device cuda:0 --verify
+
+# 3. Probe that the output loads (compressed-tensors format check)
+python3 quantization/probe_nvfp4_loading.py \
+    --model-id /workspace/qwen3-30b-nvfp4-test
+
+# 4. Full 480B run (takes several hours on CPU; use --device cuda:0 to 10x)
+python3 scripts/quantize_nvfp4_sharded.py \
+    --model-dir /workspace/fused-bf16 \
+    --output-dir /workspace/fused-nvfp4 \
+    --device cuda:0
+```
+
+**Why not llm-compressor for 480B?**  
+`DataFreePipeline` calls `dispatch_model` twice internally — the second pass
+temporarily copies the full model graph and peaks above 1 TiB RAM, causing
+`Killed` even on a 1 TiB machine with both GPUs in use. The sharded script
+sidesteps this entirely.
+
+**Output format note:**  
+The `quantization_config.format` field is set to `"float-quantized"`. If
+loading the checkpoint into vLLM fails with a format error, compare against
+a reference NVFP4 checkpoint from llm-compressor and adjust
+`make_quant_config()` in the script accordingly.
+
+---
+
+## AWQ W4A16, fusion-compatible
 
 AWQ 4-bit quantization of the **fused** Qwen3-Coder-480B using
 [llm-compressor](https://github.com/vllm-project/llm-compressor), built to
