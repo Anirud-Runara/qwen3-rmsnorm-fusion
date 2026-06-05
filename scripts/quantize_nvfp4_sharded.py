@@ -19,13 +19,13 @@ FORMAT (compressed-tensors NVFP4A16)
         Per-tensor normaliser.
 
   DEQUANT FORMULA (used by vLLM / compressed-tensors at inference):
-    w_float ≈ fp4_to_float(code) * weight_scale[g] / weight_global_scale
+    w_float ≈ fp4_to_float(code) * weight_scale[g] * weight_global_scale
 
   DERIVATION
     local_scale[g]      = max(|w_g|) / FP4_MAX           (true group scale)
-    weight_global_scale = FP8_MAX / max(local_scale)      (normaliser)
-    weight_scale[g]     = local_scale[g] * global_scale   (fits in FP8)
-    Check: weight_scale / global_scale = local_scale  ✓
+    weight_global_scale = max(local_scale) / FP8_MAX      (small normaliser)
+    weight_scale[g]     = local_scale[g] / global_scale   (fits in FP8 range)
+    Check: weight_scale * global_scale = local_scale  ✓
 
 NOT QUANTIZED (kept in original dtype):
   lm_head.weight, *.mlp.gate.weight (router gate),
@@ -165,7 +165,7 @@ def fp4_dequantize(
     """
     Reconstruct a BF16 weight from NVFP4A16 compressed format.
 
-    Formula: w ≈ fp4_to_float(code) * weight_scale[g] / weight_global_scale
+    Formula: w ≈ fp4_to_float(code) * weight_scale[g] * weight_global_scale
     """
     out_f = packed.shape[0]
     in_f  = packed.shape[1] * 2
@@ -185,7 +185,7 @@ def fp4_dequantize(
     num_groups = (in_f + group_size - 1) // group_size
     scale_f32 = scale_fp8.float()                           # [out, G] float32
     gscale = gscale_f32.float().item()
-    eff_scale = (scale_f32 / gscale)                        # [out, G]
+    eff_scale = (scale_f32 * gscale)                        # [out, G]
     # Expand to [out, in_f]
     eff_per_elem = eff_scale.unsqueeze(-1).expand(
         out_f, num_groups, group_size
