@@ -110,24 +110,57 @@ NUMERICAL_ITERS = 10
 def _decompress_weight(linear: nn.Module) -> torch.Tensor:
     """
     Return a dense [out, in] BF16 weight tensor.
-    Decompresses NVFP4 CompressedLinear if compressed-tensors is installed;
-    falls back to plain linear.weight.data for non-quantized linears.
+
+    Handles three loading patterns produced by different compressed-tensors
+    versions:
+
+    1. Class-replacement: nn.Linear is swapped for CompressedLinear.
+       Detected via isinstance(linear, CompressedLinear).
+
+    2. In-place modification (common in newer compressed-tensors):
+       The class stays as nn.Linear but .weight is set to None and a
+       .compressor object is attached to the module instance.
+
+    3. Plain nn.Linear with a valid .weight tensor (unfused BF16 linears,
+       or quantizer setup was skipped).
     """
+    # ── Pattern 1: class-replacement CompressedLinear ────────────────────────
     try:
         from compressed_tensors.linear.compressed_linear import CompressedLinear
-        from compressed_tensors.quantization import QuantizationStatus
-        if (isinstance(linear, CompressedLinear)
-                and getattr(linear, "quantization_status", None)
-                == QuantizationStatus.COMPRESSED):
+        if isinstance(linear, CompressedLinear):
             return linear.compressor.decompress_module(linear)
     except ImportError:
         pass
-    if hasattr(linear, "weight") and linear.weight is not None:
-        return linear.weight.data
-    raise AttributeError(
-        f"Cannot get dense weight from {type(linear).__name__}. "
-        "Install compressed-tensors for NVFP4 decompression."
-    )
+    except Exception as e:
+        raise RuntimeError(
+            f"CompressedLinear.decompress_module failed: {e}"
+        ) from e
+
+    # ── Pattern 2: in-place modified Linear (weight=None, compressor attr) ───
+    # compressed-tensors sometimes patches the original nn.Linear instance:
+    # it sets self.weight = None and attaches a compressor.  The class name
+    # stays "Linear" which is why isinstance(CompressedLinear) misses it.
+    if getattr(linear, "weight", None) is None:
+        compressor = getattr(linear, "compressor", None)
+        if compressor is not None:
+            try:
+                return compressor.decompress_module(linear)
+            except Exception as e:
+                raise RuntimeError(
+                    f"In-place NVFP4 decompression failed for "
+                    f"{type(linear).__name__}: {e}"
+                ) from e
+        raise AttributeError(
+            f"{type(linear).__name__}.weight is None and no .compressor "
+            "was found on the module.\n"
+            "This usually means the NVFP4 quantizer setup failed earlier "
+            "(check for 'WARNING: quantizer setup failed' in the output above).\n"
+            "Fix: ensure compressed-tensors is installed at the version that "
+            "created the checkpoint, then re-run."
+        )
+
+    # ── Pattern 3: plain nn.Linear ───────────────────────────────────────────
+    return linear.weight.data
 
 
 def _make_dense_linear(linear: nn.Module, dtype: torch.dtype) -> nn.Linear:
@@ -277,6 +310,42 @@ def _print_model_device_map(model: nn.Module, label: str) -> None:
         print(f"  [{label}] parameter devices: {dict(sorted(counts.items()))}")
 
 
+def _normalize_quant_config(q_cfg) -> dict:
+    """
+    Return a sanitized quantization_config dict compatible with the installed
+    compressed-tensors pydantic schema.
+
+    Older checkpoints (saved with compressed-tensors < 0.8) may include:
+      - weights.pytorch_dtype  — removed in newer pydantic schema
+      - config_groups values as dicts when a list is expected
+
+    We strip the known-offending fields so AutoHfQuantizer can parse the rest.
+    """
+    import copy
+    q: dict = q_cfg if isinstance(q_cfg, dict) else (
+        q_cfg.to_dict() if hasattr(q_cfg, "to_dict") else dict(q_cfg)
+    )
+    q = copy.deepcopy(q)
+
+    def _clean_quant_scheme(scheme: dict) -> dict:
+        for sub in ("weights", "input_activations", "output_activations"):
+            if isinstance(scheme.get(sub), dict):
+                scheme[sub].pop("pytorch_dtype", None)
+        return scheme
+
+    groups = q.get("config_groups", {})
+    if isinstance(groups, dict):
+        for v in groups.values():
+            if isinstance(v, dict):
+                _clean_quant_scheme(v)
+    elif isinstance(groups, list):
+        for item in groups:
+            if isinstance(item, dict):
+                _clean_quant_scheme(item)
+
+    return q
+
+
 def _load_layer_gpu(
     model_dir: str,
     layer_path: str,
@@ -349,17 +418,32 @@ def _load_layer_gpu(
     module = decoder_cls(text_cfg, layer_idx=layer_idx)
     module = module.to(device=device, dtype=DTYPE)
 
-    # Apply NVFP4 quantizer wrappers (wraps nn.Linear → CompressedLinear)
+    # Apply NVFP4 quantizer wrappers (wraps nn.Linear → CompressedLinear).
+    # Falls back to a schema-normalized config when the checkpoint was saved
+    # with an older compressed-tensors version whose pydantic fields differ.
     q_cfg = getattr(config, "quantization_config", None)
+    quantizer = None
     if q_cfg is not None:
-        try:
-            from transformers.quantizers.auto import AutoHfQuantizer
-            quantizer = AutoHfQuantizer.from_config(q_cfg)
-            quantizer._process_model_before_weight_loading(module)
-            print(f"  NVFP4 quantizer wrappers applied ({time.perf_counter() - t0:.1f}s)")
-        except Exception as e:
-            print(f"  WARNING: quantizer setup failed ({e}); loading as plain BF16")
-            q_cfg = None
+        from transformers.quantizers.auto import AutoHfQuantizer
+        for attempt, cfg_src in enumerate((q_cfg, _normalize_quant_config(q_cfg))):
+            try:
+                quantizer = AutoHfQuantizer.from_config(cfg_src)
+                quantizer._process_model_before_weight_loading(module)
+                tag = "" if attempt == 0 else " (normalized config)"
+                print(f"  NVFP4 quantizer wrappers applied{tag} ({time.perf_counter() - t0:.1f}s)")
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f"  INFO: quantizer setup failed on raw config ({type(e).__name__}), "
+                          "retrying with normalized config …")
+                else:
+                    print(f"  WARNING: quantizer setup failed on both raw and normalized configs "
+                          f"({e}); weights will be loaded as plain BF16.\n"
+                          "  If the fused checkpoint is NVFP4, q/k/v weights may not load "
+                          "correctly — verify compressed-tensors version matches the one "
+                          "used to create the checkpoint.")
+                    q_cfg = None
+                    quantizer = None
 
     # Load weights from safetensors shards
     prefix = layer_path + "."

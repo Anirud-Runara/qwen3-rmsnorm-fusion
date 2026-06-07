@@ -36,25 +36,41 @@ def _decompress_weight(linear: nn.Module) -> torch.Tensor:
     """
     Return a dense [out, in] weight tensor for fusion math.
 
-    For plain nn.Linear, returns linear.weight.data directly.
-    For NVFP4 CompressedLinear (compressed-tensors), decompresses the packed
-    FP4 representation to a dense BF16 tensor before multiplying by gamma.
+    Handles three loading patterns from different compressed-tensors versions:
+      1. Class-replacement CompressedLinear (isinstance check works).
+      2. In-place modified nn.Linear: weight=None, .compressor attached.
+      3. Plain nn.Linear with valid .weight.
     """
+    # ── Pattern 1: class-replacement CompressedLinear ────────────────────────
     try:
         from compressed_tensors.linear.compressed_linear import CompressedLinear
-        from compressed_tensors.quantization import QuantizationStatus
-        if (isinstance(linear, CompressedLinear)
-                and getattr(linear, "quantization_status", None)
-                == QuantizationStatus.COMPRESSED):
+        if isinstance(linear, CompressedLinear):
             return linear.compressor.decompress_module(linear)
     except ImportError:
         pass
-    if hasattr(linear, "weight") and linear.weight is not None:
-        return linear.weight.data
-    raise AttributeError(
-        f"{type(linear).__name__} has no dense .weight and is not NVFP4-decompressible. "
-        "Install compressed-tensors to enable NVFP4 decompression."
-    )
+    except Exception as e:
+        raise RuntimeError(
+            f"CompressedLinear.decompress_module failed: {e}"
+        ) from e
+
+    # ── Pattern 2: in-place modified Linear (weight=None, compressor attr) ───
+    if getattr(linear, "weight", None) is None:
+        compressor = getattr(linear, "compressor", None)
+        if compressor is not None:
+            try:
+                return compressor.decompress_module(linear)
+            except Exception as e:
+                raise RuntimeError(
+                    f"In-place NVFP4 decompression failed for "
+                    f"{type(linear).__name__}: {e}"
+                ) from e
+        raise AttributeError(
+            f"{type(linear).__name__}.weight is None and no .compressor found. "
+            "Install compressed-tensors for NVFP4 decompression."
+        )
+
+    # ── Pattern 3: plain nn.Linear ───────────────────────────────────────────
+    return linear.weight.data
 
 
 def compute_fused_weights(
