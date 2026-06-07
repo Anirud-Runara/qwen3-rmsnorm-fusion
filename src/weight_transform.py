@@ -28,6 +28,35 @@ import torch
 import torch.nn as nn
 
 
+# ---------------------------------------------------------------------------
+# NVFP4 / compressed-tensors helpers
+# ---------------------------------------------------------------------------
+
+def _decompress_weight(linear: nn.Module) -> torch.Tensor:
+    """
+    Return a dense [out, in] weight tensor for fusion math.
+
+    For plain nn.Linear, returns linear.weight.data directly.
+    For NVFP4 CompressedLinear (compressed-tensors), decompresses the packed
+    FP4 representation to a dense BF16 tensor before multiplying by gamma.
+    """
+    try:
+        from compressed_tensors.linear.compressed_linear import CompressedLinear
+        from compressed_tensors.quantization import QuantizationStatus
+        if (isinstance(linear, CompressedLinear)
+                and getattr(linear, "quantization_status", None)
+                == QuantizationStatus.COMPRESSED):
+            return linear.compressor.decompress_module(linear)
+    except ImportError:
+        pass
+    if hasattr(linear, "weight") and linear.weight is not None:
+        return linear.weight.data
+    raise AttributeError(
+        f"{type(linear).__name__} has no dense .weight and is not NVFP4-decompressible. "
+        "Install compressed-tensors to enable NVFP4 decompression."
+    )
+
+
 def compute_fused_weights(
     ln: nn.LayerNorm,
     linear: nn.Linear,
@@ -92,16 +121,15 @@ def compute_fused_weights_rmsnorm(
         eps: RMSNorm epsilon
     """
     gamma = rms_norm.weight.data    # [h]
-    W = linear.weight.data          # [out, h]
+    W = _decompress_weight(linear)  # [out, h]; NVFP4-safe
     b = linear.bias.data if linear.bias is not None else torch.zeros(
         W.size(0), device=W.device, dtype=W.dtype
     )
     h = gamma.shape[0]
     eps = rms_norm.eps if hasattr(rms_norm, 'eps') else rms_norm.variance_epsilon
 
-    # W_new = W * gamma (element-wise broadcast), shape [out, h]
-    # No centering needed since RMSNorm doesn't subtract mean
-    W_new = W * gamma
+    gamma_cast = gamma.to(W.dtype)
+    W_new = W * gamma_cast
 
     # b_new = b (no beta in RMSNorm)
     b_new = b
@@ -169,11 +197,12 @@ def compute_fused_weights_rmsnorm_combined(
     split_sizes = []
 
     for linear in linears:
-        W = linear.weight.data          # [out_i, h]
+        W = _decompress_weight(linear)  # [out_i, h]; NVFP4-safe
         b = linear.bias.data if linear.bias is not None else torch.zeros(
             W.size(0), device=W.device, dtype=W.dtype
         )
-        W_parts.append(W * gamma)       # element-wise, no centering
+        gamma_cast = gamma.to(W.dtype)
+        W_parts.append(W * gamma_cast)  # element-wise, no centering
         b_parts.append(b)
         split_sizes.append(W.size(0))
 
