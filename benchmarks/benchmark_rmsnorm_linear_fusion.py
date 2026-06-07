@@ -159,43 +159,67 @@ def _decompress_weight(linear: nn.Module) -> torch.Tensor:
         # Try compressed-tensors' class-level or registry-level decompressor.
         _w_packed = getattr(linear, "weight_packed", None)
         if _w_packed is not None:
+            # ── Attempt A: CompressedLinear class-level compressor ───────────
             try:
                 from compressed_tensors.linear.compressed_linear import CompressedLinear
-                # CompressedLinear stores the compressor at class level — try
-                # using it on the in-place-modified instance which has the same
-                # buffer layout.
                 if hasattr(CompressedLinear, "compressor"):
                     return CompressedLinear.compressor.decompress_module(linear)
             except Exception:
                 pass
-            try:
-                # Fallback: compressed-tensors >= 0.9 uses a separate
-                # quantization compressor reachable via the module's scheme.
-                scheme = getattr(linear, "quantization_scheme", None)
-                if scheme is not None:
-                    from compressed_tensors.compressors.quantized_compressors import (
-                        QuantizationCompressor,
-                    )
-                    comp = QuantizationCompressor.load_from_registry(
-                        scheme.weights.type
-                    )
+
+            # ── Attempt B: Float/Int quantization compressor via scheme ──────
+            # NVFP4 → type=FLOAT, num_bits=4 → FloatQuantizationCompressor
+            # INT4  → type=INT  , num_bits=4 → IntQuantizationCompressor
+            scheme = getattr(linear, "quantization_scheme", None)
+            for comp_module, comp_cls in (
+                (
+                    "compressed_tensors.compressors.quantized_compressors.float_quantized",
+                    "FloatQuantizationCompressor",
+                ),
+                (
+                    "compressed_tensors.compressors.quantized_compressors.int_quantized",
+                    "IntQuantizationCompressor",
+                ),
+                (
+                    "compressed_tensors.compressors.quantized_compressors.base",
+                    "BaseQuantizationCompressor",
+                ),
+            ):
+                try:
+                    import importlib
+                    mod = importlib.import_module(comp_module)
+                    cls = getattr(mod, comp_cls)
+                    # Try registry lookup first, then bare instantiation
+                    if scheme is not None:
+                        try:
+                            comp = cls.load_from_registry(
+                                getattr(scheme.weights, "type", "float")
+                            )
+                        except Exception:
+                            comp = cls()
+                    else:
+                        comp = cls()
                     return comp.decompress_module(linear)
-            except Exception:
-                pass
-            # Still no luck — raise with diagnostic info so we can see exactly
-            # what the module has.
-            _quant_attrs = sorted(
-                a for a in dir(linear)
-                if any(tok in a for tok in ("weight", "quant", "compress", "scale", "packed"))
-                and not a.startswith("__")
-            )
-            raise AttributeError(
-                f"{type(linear).__name__}.weight is None, weight_packed present "
-                f"(shape={tuple(_w_packed.shape)}), but could not find a working "
-                f"decompressor.\n"
-                f"  weight/quant/compress attrs on module: {_quant_attrs}\n"
-                f"  Post this output and we will add the exact decompression path."
-            )
+                except Exception:
+                    continue
+
+            # ── Attempt C: identity-matrix forward pass ───────────────────────
+            # For linear(x) = x @ W.T, feeding an identity matrix gives W.T.
+            # Reliable regardless of compressed-tensors version.  Runs in ~5 ms
+            # for typical Qwen3-MoE dimensions; only runs once at setup time.
+            try:
+                in_feats = getattr(linear, "in_features", None) or (_w_packed.shape[1] * 2)
+                dev = _w_packed.device
+                x_id = torch.eye(in_feats, device=dev, dtype=DTYPE)
+                with torch.no_grad():
+                    W_T = linear(x_id)   # [in_feats, out_feats]
+                return W_T.T.contiguous()  # [out_feats, in_feats]
+            except Exception as e:
+                raise RuntimeError(
+                    f"All decompression attempts failed for "
+                    f"{type(linear).__name__} (weight_packed shape "
+                    f"{tuple(_w_packed.shape)}). Last error: {e}"
+                ) from e
 
         # Neither weight nor weight_packed — genuinely broken load.
         raise AttributeError(
