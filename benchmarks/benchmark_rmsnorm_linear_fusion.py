@@ -457,11 +457,28 @@ def _load_layer_gpu(
 
     shards_needed = {weight_map[k] for k in layer_keys}
     state: dict[str, torch.Tensor] = {}
+    _prefix_mismatch_warned = False
     for shard in shards_needed:
-        tensors = load_file(os.path.join(model_dir, shard), device=device)
+        raw = load_file(os.path.join(model_dir, shard), device=device)
+        # Build a secondary lookup that strips the leading 'model.' scope from
+        # each key.  Some quantization / fusion pipelines save shard files
+        # without the top-level 'model.' prefix even though the index has it,
+        # causing an exact-match miss for every tensor except the few whose
+        # names happen to be identical in both the index and the shard file.
+        alt = {k2.removeprefix("model."): v for k2, v in raw.items()}
         for k in layer_keys:
-            if k in tensors:
-                state[k[len(prefix):]] = tensors[k]
+            if k in raw:
+                state[k[len(prefix):]] = raw[k]
+            else:
+                k_alt = k.removeprefix("model.")
+                if k_alt in alt:
+                    if not _prefix_mismatch_warned:
+                        print(
+                            "  NOTE: shard keys lack 'model.' prefix — "
+                            "loading via stripped-prefix fallback."
+                        )
+                        _prefix_mismatch_warned = True
+                    state[k[len(prefix):]] = alt[k_alt]
 
     missing, unexpected = module.load_state_dict(state, strict=False)
     if missing:
