@@ -38,7 +38,7 @@ def _decompress_weight(linear: nn.Module) -> torch.Tensor:
 
     Handles three loading patterns from different compressed-tensors versions:
       1. Class-replacement CompressedLinear (isinstance check works).
-      2. In-place modified nn.Linear: weight=None, .compressor attached.
+      2. In-place modified nn.Linear: weight absent/None, packed buffers present.
       3. Plain nn.Linear with valid .weight.
     """
     # ── Pattern 1: class-replacement CompressedLinear ────────────────────────
@@ -53,21 +53,99 @@ def _decompress_weight(linear: nn.Module) -> torch.Tensor:
             f"CompressedLinear.decompress_module failed: {e}"
         ) from e
 
-    # ── Pattern 2: in-place modified Linear (weight=None, compressor attr) ───
+    # ── Pattern 2: in-place modified Linear (weight absent or None) ──────────
+    # Some compressed-tensors versions remove 'weight' from _parameters
+    # entirely when registering packed buffers.  Inject None as a sentinel so
+    # CT's patched quantized_forward can access self.weight without raising
+    # AttributeError, then follow its lazy-decompression path.
     if getattr(linear, "weight", None) is None:
-        compressor = getattr(linear, "compressor", None)
-        if compressor is not None:
-            try:
-                return compressor.decompress_module(linear)
-            except Exception as e:
-                raise RuntimeError(
-                    f"In-place NVFP4 decompression failed for "
-                    f"{type(linear).__name__}: {e}"
-                ) from e
-        raise AttributeError(
-            f"{type(linear).__name__}.weight is None and no .compressor found. "
-            "Install compressed-tensors for NVFP4 decompression."
-        )
+        _weight_injected = "weight" not in linear._parameters
+        if _weight_injected:
+            linear._parameters["weight"] = None
+
+        try:
+            # Instance-level compressor attribute (older CT versions)
+            for _comp_attr in ("compressor", "_compressor", "_module_compressor"):
+                _comp = getattr(linear, _comp_attr, None)
+                if _comp is not None:
+                    try:
+                        return _comp.decompress_module(linear)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"In-place NVFP4 decompression via .{_comp_attr} failed "
+                            f"for {type(linear).__name__}: {e}"
+                        ) from e
+
+            _w_packed = getattr(linear, "weight_packed", None)
+            if _w_packed is not None:
+                # Attempt A: CompressedLinear class-level compressor
+                try:
+                    from compressed_tensors.linear.compressed_linear import CompressedLinear
+                    if hasattr(CompressedLinear, "compressor"):
+                        return CompressedLinear.compressor.decompress_module(linear)
+                except Exception:
+                    pass
+
+                # Attempt B: Float/Int quantization compressor via scheme
+                scheme = getattr(linear, "quantization_scheme", None)
+                _b_errors: list[str] = []
+                for comp_module, comp_cls in (
+                    (
+                        "compressed_tensors.compressors.quantized_compressors.float_quantized",
+                        "FloatQuantizationCompressor",
+                    ),
+                    (
+                        "compressed_tensors.compressors.quantized_compressors.int_quantized",
+                        "IntQuantizationCompressor",
+                    ),
+                    (
+                        "compressed_tensors.compressors.quantized_compressors.base",
+                        "BaseQuantizationCompressor",
+                    ),
+                ):
+                    try:
+                        import importlib
+                        mod = importlib.import_module(comp_module)
+                        cls = getattr(mod, comp_cls)
+                        if scheme is not None:
+                            try:
+                                comp = cls.load_from_registry(
+                                    getattr(scheme.weights, "type", "float")
+                                )
+                            except Exception:
+                                comp = cls()
+                        else:
+                            comp = cls()
+                        return comp.decompress_module(linear)
+                    except Exception as _be:
+                        _b_errors.append(f"{comp_cls}: {_be}")
+                        continue
+
+                # Attempt C: identity-matrix forward pass
+                # linear(I) = I @ W.T = W.T; transpose gives W.
+                try:
+                    in_feats = getattr(linear, "in_features", None) or (_w_packed.shape[1] * 2)
+                    dev = _w_packed.device
+                    x_id = torch.eye(in_feats, device=dev, dtype=torch.bfloat16)
+                    with torch.no_grad():
+                        W_T = linear(x_id)
+                    return W_T.T.contiguous()
+                except Exception as _ce:
+                    raise RuntimeError(
+                        f"All decompression attempts failed for "
+                        f"{type(linear).__name__} (weight_packed shape "
+                        f"{tuple(_w_packed.shape)}). "
+                        f"Attempt B sub-errors: {_b_errors or 'none'}. "
+                        f"Attempt C error: {_ce}"
+                    ) from _ce
+
+            raise AttributeError(
+                f"{type(linear).__name__}.weight is None and no .weight_packed buffer "
+                "found. The NVFP4 quantizer setup likely failed."
+            )
+        finally:
+            if _weight_injected and linear._parameters.get("weight") is None:
+                del linear._parameters["weight"]
 
     # ── Pattern 3: plain nn.Linear ───────────────────────────────────────────
     return linear.weight.data
