@@ -550,6 +550,30 @@ def _load_layer_gpu(
             f"{_restored[:3]}{'…' if len(_restored) > 3 else ''}"
         )
 
+    # ── Attach NVFP4 buffers directly from the checkpoint ────────────────────
+    # The HF quantizer doesn't always create a slot for every NVFP4 buffer
+    # (older/normalized configs frequently omit weight_global_scale), so
+    # load_state_dict silently drops those keys into `unexpected`.  We forcibly
+    # attach whatever the checkpoint actually provides, so _decompress_weight
+    # always sees a complete, self-consistent {packed, scale, global_scale} set
+    # regardless of what the quantizer did.
+    _QUANT_SUFFIXES = (
+        "weight_packed", "weight_scale", "weight_global_scale",
+        "weight_shape", "weight_zero_point",
+    )
+    _mods = dict(module.named_modules())
+    _attached = 0
+    for key, tensor in state.items():
+        for suf in _QUANT_SUFFIXES:
+            if key.endswith("." + suf):
+                submod = _mods.get(key[: -(len(suf) + 1)])
+                if submod is not None and getattr(submod, suf, None) is None:
+                    submod.register_buffer(suf, tensor.to(device), persistent=False)
+                    _attached += 1
+                break
+    if _attached:
+        print(f"  Attached {_attached} NVFP4 buffer(s) directly from checkpoint")
+
     # ── Sanity-check attention weights ───────────────────────────────────────
     # If q_proj.weight is still None after all loading attempts, the checkpoint
     # is missing the attention weights entirely (wrong format or wrong layer).
