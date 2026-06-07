@@ -107,146 +107,95 @@ NUMERICAL_ITERS = 10
 # Benchmark modules
 # ---------------------------------------------------------------------------
 
+# E2M1 (FP4) magnitude lookup: the 3 magnitude bits index these values.
+# The 4th bit is the sign.  This table is fixed by the NVFP4 spec.
+_E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
+
+def _dequantize_nvfp4(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    out_dtype: torch.dtype = DTYPE,
+) -> torch.Tensor:
+    """
+    Reconstruct a dense [out, in] weight from NVFP4 compressed-tensors buffers.
+
+    NVFP4 layout (fixed by the spec, identical across compressed-tensors
+    versions):
+
+        weight_packed        uint8           (out, in // 2)   2 FP4 codes/byte
+        weight_scale         float8_e4m3fn   (out, in // 16)  per-block scale
+        weight_global_scale  float32         scalar           per-tensor scale
+
+    Reconstruction, per element:
+
+        W = E2M1(code) * (weight_scale / weight_global_scale)
+
+    The global scale stores the *quantization* scale, so we divide by it
+    (NVIDIA/compressed-tensors convention).  Block size is inferred from the
+    shapes (in // n_scale_cols), which is 16 for NVFP4.
+    """
+    device = weight_packed.device
+    lut = _E2M1_LUT.to(device)
+
+    packed = weight_packed.view(torch.uint8)            # (out, in//2)
+    out_dim, in_half = packed.shape
+
+    low_nib = packed & 0x0F
+    high_nib = (packed >> 4) & 0x0F
+
+    def _decode(nib: torch.Tensor) -> torch.Tensor:
+        sign = 1.0 - 2.0 * ((nib >> 3) & 1).to(torch.float32)  # bit3 → sign
+        return sign * lut[(nib & 0x07).long()]
+
+    # Low nibble = even column, high nibble = odd column.
+    vals = torch.empty(out_dim, in_half * 2, device=device, dtype=torch.float32)
+    vals[:, 0::2] = _decode(low_nib)
+    vals[:, 1::2] = _decode(high_nib)
+
+    in_dim = in_half * 2
+    n_blocks = weight_scale.shape[1]
+    block = in_dim // n_blocks                                  # == 16
+
+    scale = weight_scale.to(torch.float32) / weight_global_scale.to(torch.float32)
+    scale = scale.repeat_interleave(block, dim=1)               # (out, in)
+
+    return (vals * scale).to(out_dtype)
+
+
 def _decompress_weight(linear: nn.Module) -> torch.Tensor:
     """
-    Return a dense [out, in] BF16 weight tensor.
+    Return a dense [out, in] weight tensor.
 
-    Handles three loading patterns produced by different compressed-tensors
-    versions:
+    Only two cases exist — and both are read directly from the module's own
+    tensors, with no dependency on any compressed-tensors decompression API:
 
-    1. Class-replacement: nn.Linear is swapped for CompressedLinear.
-       Detected via isinstance(linear, CompressedLinear).
+      1. Dense weight present  → return it (plain BF16 checkpoint, or a weight
+         that was restored after CompressedLinear wrapping displaced it).
+      2. NVFP4 packed buffers  → dequantize with _dequantize_nvfp4().
 
-    2. In-place modification (common in newer compressed-tensors):
-       The class stays as nn.Linear but .weight is set to None and a
-       .compressor object is attached to the module instance.
-
-    3. Plain nn.Linear with a valid .weight tensor (unfused BF16 linears,
-       or quantizer setup was skipped).
+    `getattr(linear, "weight", None)` safely returns None whether .weight is
+    set to None or removed from _parameters entirely by the quantizer hooks.
     """
-    # ── Pattern 1: class-replacement CompressedLinear ────────────────────────
-    try:
-        from compressed_tensors.linear.compressed_linear import CompressedLinear
-        if isinstance(linear, CompressedLinear):
-            return linear.compressor.decompress_module(linear)
-    except ImportError:
-        pass
-    except Exception as e:
-        raise RuntimeError(
-            f"CompressedLinear.decompress_module failed: {e}"
-        ) from e
+    w = getattr(linear, "weight", None)
+    if w is not None:
+        return w.data
 
-    # ── Pattern 2: in-place modified Linear (weight absent or None) ─────────
-    # compressed-tensors' lifecycle hooks sometimes remove 'weight' from
-    # _parameters entirely (instead of just setting it to None) when they
-    # register the packed buffers.  The patched quantized_forward still does:
-    #
-    #     weight = self.weight  # onload once   (CT lifecycle/forward.py:272)
-    #
-    # which raises AttributeError when 'weight' is absent from _parameters.
-    # We inject None as a sentinel so `self.weight` returns None, enabling
-    # CT's own lazy-decompression path that reads weight_packed + scales.
-    if getattr(linear, "weight", None) is None:
-        _weight_injected = "weight" not in linear._parameters
-        if _weight_injected:
-            linear._parameters["weight"] = None   # direct dict write, no side-effects
+    wp = getattr(linear, "weight_packed", None)
+    if wp is not None:
+        return _dequantize_nvfp4(
+            wp, linear.weight_scale, linear.weight_global_scale, DTYPE
+        )
 
-        try:
-            # ── Try every plausible instance-level compressor attribute ──────
-            for _comp_attr in ("compressor", "_compressor", "_module_compressor"):
-                _comp = getattr(linear, _comp_attr, None)
-                if _comp is not None:
-                    try:
-                        return _comp.decompress_module(linear)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"In-place NVFP4 decompression via .{_comp_attr} failed "
-                            f"for {type(linear).__name__}: {e}"
-                        ) from e
-
-            # weight_packed present: no instance compressor found — try
-            # class-level / registry-level decompressors, then forward().
-            _w_packed = getattr(linear, "weight_packed", None)
-            if _w_packed is not None:
-                # ── Attempt A: CompressedLinear class-level compressor ───────
-                try:
-                    from compressed_tensors.linear.compressed_linear import CompressedLinear
-                    if hasattr(CompressedLinear, "compressor"):
-                        return CompressedLinear.compressor.decompress_module(linear)
-                except Exception:
-                    pass
-
-                # ── Attempt B: Float/Int quantization compressor via scheme ──
-                # NVFP4 → FloatQuantizationCompressor
-                # INT4  → IntQuantizationCompressor
-                scheme = getattr(linear, "quantization_scheme", None)
-                _b_errors: list[str] = []
-                for comp_module, comp_cls in (
-                    (
-                        "compressed_tensors.compressors.quantized_compressors.float_quantized",
-                        "FloatQuantizationCompressor",
-                    ),
-                    (
-                        "compressed_tensors.compressors.quantized_compressors.int_quantized",
-                        "IntQuantizationCompressor",
-                    ),
-                    (
-                        "compressed_tensors.compressors.quantized_compressors.base",
-                        "BaseQuantizationCompressor",
-                    ),
-                ):
-                    try:
-                        import importlib
-                        mod = importlib.import_module(comp_module)
-                        cls = getattr(mod, comp_cls)
-                        if scheme is not None:
-                            try:
-                                comp = cls.load_from_registry(
-                                    getattr(scheme.weights, "type", "float")
-                                )
-                            except Exception:
-                                comp = cls()
-                        else:
-                            comp = cls()
-                        return comp.decompress_module(linear)
-                    except Exception as _be:
-                        _b_errors.append(f"{comp_cls}: {_be}")
-                        continue
-
-                # ── Attempt C: identity-matrix forward pass ───────────────────
-                # With 'weight'=None now guaranteed in _parameters, CT's patched
-                # quantized_forward can access self.weight (gets None) and then
-                # follow its own lazy-decompression path (weight_packed + scales).
-                # linear(I) gives W.T directly: linear(x) = x @ W.T.
-                try:
-                    in_feats = getattr(linear, "in_features", None) or (_w_packed.shape[1] * 2)
-                    dev = _w_packed.device
-                    x_id = torch.eye(in_feats, device=dev, dtype=DTYPE)
-                    with torch.no_grad():
-                        W_T = linear(x_id)   # [in_feats, out_feats]
-                    return W_T.T.contiguous()  # [out_feats, in_feats]
-                except Exception as _ce:
-                    raise RuntimeError(
-                        f"All decompression attempts failed for "
-                        f"{type(linear).__name__} (weight_packed shape "
-                        f"{tuple(_w_packed.shape)}). "
-                        f"Attempt B sub-errors: {_b_errors or 'none'}. "
-                        f"Attempt C error: {_ce}"
-                    ) from _ce
-
-            # Neither weight nor weight_packed — genuinely broken load.
-            raise AttributeError(
-                f"{type(linear).__name__}.weight is None and no .weight_packed buffer "
-                "found. The NVFP4 quantizer setup likely failed — check for "
-                "'WARNING: quantizer setup failed' earlier in the output."
-            )
-        finally:
-            # Remove the injected sentinel so the module is left unchanged.
-            if _weight_injected and linear._parameters.get("weight") is None:
-                del linear._parameters["weight"]
-
-    # ── Pattern 3: plain nn.Linear ───────────────────────────────────────────
-    return linear.weight.data
+    raise AttributeError(
+        f"{type(linear).__name__} has neither a dense .weight nor NVFP4 "
+        ".weight_packed buffers. The checkpoint did not load correctly — "
+        "check for 'WARNING: quantizer setup failed' or missing-key warnings "
+        "earlier in the output."
+    )
 
 
 def _make_dense_linear(linear: nn.Module, dtype: torch.dtype) -> nn.Linear:
