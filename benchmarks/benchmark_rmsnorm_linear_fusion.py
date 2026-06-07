@@ -475,6 +475,54 @@ def _load_layer_gpu(
         except Exception as e:
             print(f"  WARNING: post-weight-loading quantizer step failed ({e})")
 
+    # ── Restore plain BF16 weights that CompressedLinear wrapping displaced ──
+    # When a checkpoint uses NVFP4 only for certain layers (e.g., MoE experts
+    # but NOT attention projections), _process_model_before_weight_loading
+    # still wraps ALL linears as CompressedLinear and clears their .weight.
+    # The plain 'weight' tensors in the state dict then fall into unexpected_keys
+    # and never load.  Detect these and restore them directly.
+    _restored: list = []
+    for mod_name, submod in module.named_modules():
+        if getattr(submod, "weight", None) is not None:
+            continue  # weight already loaded — nothing to fix
+        plain_key = f"{mod_name}.weight"
+        if plain_key not in state:
+            continue  # weight missing from checkpoint too — genuine missing key
+        w = state[plain_key].to(dtype=DTYPE, device=device)
+        submod._parameters["weight"] = nn.Parameter(w, requires_grad=False)
+        _restored.append(mod_name)
+    if _restored:
+        print(
+            f"  Restored plain BF16 weights for {len(_restored)} module(s) "
+            f"(stored as dense float in checkpoint, not packed NVFP4): "
+            f"{_restored[:3]}{'…' if len(_restored) > 3 else ''}"
+        )
+
+    # ── Sanity-check attention weights ───────────────────────────────────────
+    # If q_proj.weight is still None after all loading attempts, the checkpoint
+    # is missing the attention weights entirely (wrong format or wrong layer).
+    try:
+        attn = module.self_attn
+        q_w = getattr(attn.q_proj, "weight", None)
+        q_packed = getattr(attn.q_proj, "weight_packed", None)
+        if q_w is None and q_packed is None:
+            # Print what keys ARE present so the user can diagnose
+            attn_keys = sorted(k for k in state if "attn" in k or "proj" in k)
+            print(
+                f"  WARNING: self_attn.q_proj has neither .weight nor "
+                f".weight_packed after loading.\n"
+                f"  Attention-related keys found in state dict "
+                f"({len(attn_keys)}): {attn_keys[:8]}"
+                f"{'…' if len(attn_keys) > 8 else ''}\n"
+                f"  If this list is empty the checkpoint may use a different "
+                f"key prefix — run the diagnostic below:\n"
+                f"    python3 -c \""
+                f"import json; wm=json.load(open('{model_dir}/model.safetensors.index.json'))['weight_map']; "
+                f"[print(k) for k in sorted(wm) if 'layers.0' in k]\""
+            )
+    except AttributeError:
+        pass
+
     module.eval()
     print(
         f"  Loaded {len(state)} tensors from {len(shards_needed)} shard(s) "
