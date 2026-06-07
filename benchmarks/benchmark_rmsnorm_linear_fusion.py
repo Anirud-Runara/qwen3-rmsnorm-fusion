@@ -324,11 +324,26 @@ def _load_layer_gpu(
         except Exception:
             continue
 
+    # Fallback: import decoder layer class directly from transformers (no
+    # custom modeling files needed in the checkpoint directory).
+    if decoder_cls is None:
+        for mod_path, cls_name in (
+            ("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeDecoderLayer"),
+            ("transformers.models.qwen3.modeling_qwen3",         "Qwen3DecoderLayer"),
+        ):
+            try:
+                import importlib
+                decoder_cls = getattr(importlib.import_module(mod_path), cls_name)
+                print(f"  Using {cls_name} from {mod_path}")
+                break
+            except Exception:
+                continue
+
     if decoder_cls is None:
         raise RuntimeError(
-            f"Could not import Qwen3 decoder layer class from {model_dir}.\n"
-            "The checkpoint may not have trust_remote_code modeling files.\n"
-            "Retry with --load-mode full."
+            f"Could not import Qwen3 decoder layer class from {model_dir} "
+            "or from the installed transformers package.\n"
+            "Ensure transformers >= 4.51 is installed, or retry with --load-mode full."
         )
 
     module = decoder_cls(text_cfg, layer_idx=layer_idx)
