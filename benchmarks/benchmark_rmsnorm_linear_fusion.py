@@ -136,27 +136,72 @@ def _decompress_weight(linear: nn.Module) -> torch.Tensor:
             f"CompressedLinear.decompress_module failed: {e}"
         ) from e
 
-    # ── Pattern 2: in-place modified Linear (weight=None, compressor attr) ───
+    # ── Pattern 2: in-place modified Linear (weight=None) ────────────────────
     # compressed-tensors sometimes patches the original nn.Linear instance:
-    # it sets self.weight = None and attaches a compressor.  The class name
-    # stays "Linear" which is why isinstance(CompressedLinear) misses it.
+    # it sets self.weight = None and loads packed weights into named buffers
+    # (weight_packed, weight_scale, weight_global_scale). The class stays
+    # "Linear" which is why isinstance(CompressedLinear) misses it.
     if getattr(linear, "weight", None) is None:
-        compressor = getattr(linear, "compressor", None)
-        if compressor is not None:
+        # Try every plausible compressor attribute name
+        for _comp_attr in ("compressor", "_compressor", "_module_compressor"):
+            _comp = getattr(linear, _comp_attr, None)
+            if _comp is not None:
+                try:
+                    return _comp.decompress_module(linear)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"In-place NVFP4 decompression via .{_comp_attr} failed "
+                        f"for {type(linear).__name__}: {e}"
+                    ) from e
+
+        # weight_packed present: module was modified in-place and has packed
+        # buffers but no instance-level compressor attribute.
+        # Try compressed-tensors' class-level or registry-level decompressor.
+        _w_packed = getattr(linear, "weight_packed", None)
+        if _w_packed is not None:
             try:
-                return compressor.decompress_module(linear)
-            except Exception as e:
-                raise RuntimeError(
-                    f"In-place NVFP4 decompression failed for "
-                    f"{type(linear).__name__}: {e}"
-                ) from e
+                from compressed_tensors.linear.compressed_linear import CompressedLinear
+                # CompressedLinear stores the compressor at class level — try
+                # using it on the in-place-modified instance which has the same
+                # buffer layout.
+                if hasattr(CompressedLinear, "compressor"):
+                    return CompressedLinear.compressor.decompress_module(linear)
+            except Exception:
+                pass
+            try:
+                # Fallback: compressed-tensors >= 0.9 uses a separate
+                # quantization compressor reachable via the module's scheme.
+                scheme = getattr(linear, "quantization_scheme", None)
+                if scheme is not None:
+                    from compressed_tensors.compressors.quantized_compressors import (
+                        QuantizationCompressor,
+                    )
+                    comp = QuantizationCompressor.load_from_registry(
+                        scheme.weights.type
+                    )
+                    return comp.decompress_module(linear)
+            except Exception:
+                pass
+            # Still no luck — raise with diagnostic info so we can see exactly
+            # what the module has.
+            _quant_attrs = sorted(
+                a for a in dir(linear)
+                if any(tok in a for tok in ("weight", "quant", "compress", "scale", "packed"))
+                and not a.startswith("__")
+            )
+            raise AttributeError(
+                f"{type(linear).__name__}.weight is None, weight_packed present "
+                f"(shape={tuple(_w_packed.shape)}), but could not find a working "
+                f"decompressor.\n"
+                f"  weight/quant/compress attrs on module: {_quant_attrs}\n"
+                f"  Post this output and we will add the exact decompression path."
+            )
+
+        # Neither weight nor weight_packed — genuinely broken load.
         raise AttributeError(
-            f"{type(linear).__name__}.weight is None and no .compressor "
-            "was found on the module.\n"
-            "This usually means the NVFP4 quantizer setup failed earlier "
-            "(check for 'WARNING: quantizer setup failed' in the output above).\n"
-            "Fix: ensure compressed-tensors is installed at the version that "
-            "created the checkpoint, then re-run."
+            f"{type(linear).__name__}.weight is None and no .weight_packed buffer "
+            "found. The NVFP4 quantizer setup likely failed — check for "
+            "'WARNING: quantizer setup failed' earlier in the output."
         )
 
     # ── Pattern 3: plain nn.Linear ───────────────────────────────────────────
