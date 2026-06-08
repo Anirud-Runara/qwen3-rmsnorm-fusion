@@ -43,6 +43,38 @@ loading the checkpoint into vLLM fails with a format error, compare against
 a reference NVFP4 checkpoint from llm-compressor and adjust
 `make_quant_config()` in the script accordingly.
 
+### ⚠️ Known bug: global-scale dequant convention mismatch
+
+The sharded quantizer and the benchmark currently disagree on how the
+per-tensor global scale is applied, and the two are mathematically inconsistent:
+
+| File | Reconstruction |
+|---|---|
+| `scripts/quantize_nvfp4_sharded.py` → `fp4_dequantize` | `code × weight_scale × weight_global_scale` (**multiply**) |
+| `benchmarks/benchmark_rmsnorm_linear_fusion.py` → `_dequantize_nvfp4` | `code × weight_scale ÷ weight_global_scale` (**divide**) |
+
+Because the quantizer stores `weight_global_scale = max_local_scale / FP8_MAX`
+(a ~1e-6 number), *dividing* by it inflates the reconstructed weights by ~1e10.
+This is the most likely cause of the broken `checkpoints`-mode benchmark
+numbers (cosine ≈ 0.944, max|diff| ≈ 3e9). The `runtime-patch` mode is
+unaffected because both arms share the same (consistent) dequant path.
+
+**Fix:** decide the canonical convention by validating against a known-good
+llm-compressor NVFP4 checkpoint (quantize the 30B with both llm-compressor and
+this script, then compare reconstructed weights tensor-by-tensor), then make
+both call sites agree. Until then, trust only `runtime-patch` benchmark numbers.
+
+### Results & validation status
+
+- **Pipeline validated on Qwen3-30B-A3B**, then run on the fused BF16 480B;
+  the resulting fused NVFP4A16 checkpoint is uploaded to HuggingFace.
+- **`--verify`** reports per-tensor reconstruction error against the source
+  BF16 (expect ~5–15% mean relative error for FP4 RTN; larger ⇒ bug).
+- **Still open:** a real `compressed-tensors` / vLLM load round-trip of the
+  uploaded checkpoint (format-field + global-scale convention, per the bug
+  above), and confirming the team's unfused baseline uses the *same*
+  weight-only NVFP4A16 scheme for comparability.
+
 ---
 
 ## AWQ W4A16, fusion-compatible
